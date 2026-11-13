@@ -1,0 +1,145 @@
+# Codemagic CI for Reynard Browser.
+#
+# Produces unsigned TrollStore and jailbroken builds. No Apple developer
+# account is needed; the packaged app is ad-hoc signed with ldid.
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE THE FIRST RUN
+#
+# A cold Gecko build takes far longer than Codemagic's 120 minute ceiling
+# (max_build_duration max is 120, and it cannot be raised). On the upstream
+# GitHub runners the "Build Gecko" step alone took ~305 minutes. That means a
+# single Codemagic run CANNOT finish a cold build from scratch.
+#
+# The way to make this work is to keep the expensive intermediate state on
+# Codemagic's cache and resume across runs:
+#
+#   1. Run the workflow. It will be killed at 120 minutes, inside "Build Gecko".
+#   2. Run it again. The Gecko object cache is restored, so it advances further.
+#   3. Repeat until the run reaches "Create TrollStore TIPA".
+#
+# This is why `cache` below stores engine/firefox/obj-* and .sccache and why the
+# Gecko build is passed --auto-clobber: mozilla's own autoclobber would otherwise
+# wipe the partially built tree when it decides the configuration changed, which
+# would throw away everything the previous run accomplished.
+#
+# The cache is capped at 3GB (personal) / 10GB (team). A partial Gecko objdir
+# can exceed that, so on a personal account the cache may not be kept at all and
+# the build will never get past Gecko. A machine with more memory (mac_mini_m4,
+# needs billing) and a team account with the 10GB cache are strongly advised.
+# ---------------------------------------------------------------------------
+
+definitions:
+  install_deps: &install_deps
+    name: Install build dependencies
+    script: |
+      set -e
+      export PATH="/opt/homebrew/bin:$PATH"
+      brew install lld cbindgen llvm ldid sccache
+
+      # Rust is not preinstalled on the Codemagic macOS image.
+      if ! command -v rustup >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+      fi
+      # shellcheck disable=SC1091
+      . "$HOME/.cargo/env"
+      rustup target add aarch64-apple-ios
+
+      # build-gecko.sh invokes $SCCACHE_PATH when passed --use-sccache.
+      mkdir -p "$CM_BUILD_DIR/.sccache-bin"
+      ln -sf "$(brew --prefix sccache)/bin/sccache" "$CM_BUILD_DIR/.sccache-bin/sccache"
+
+      # Persist across scripts via CM_ENV (writing PATH to `vars` risks a
+      # literal, unexpanded $PATH).
+      echo "PATH=$PATH" >> "$CM_ENV"
+      echo "SCCACHE_PATH=$CM_BUILD_DIR/.sccache-bin/sccache" >> "$CM_ENV"
+      echo "SCCACHE_DIR=$CM_BUILD_DIR/.sccache" >> "$CM_ENV"
+
+  gecko_source: &gecko_source
+    name: Update Gecko source
+    script: ./tools/development/update-gecko.sh
+
+  gecko_patches: &gecko_patches
+    name: Apply Gecko patches
+    script: ./tools/development/apply-patches.sh
+
+  idevice: &idevice
+    name: Build idevice support library
+    script: |
+      set -e
+      # shellcheck disable=SC1091
+      . "$HOME/.cargo/env"
+      ./tools/development/build-idevice.sh
+
+  build_app: &build_app
+    name: Build app
+    script: ./tools/release/build-app.sh --no-signing --nightly
+
+  # Shared between both workflows. Anchors cannot be merged, so the PATH and
+  # SCCACHE_* values are repeated in each workflow's environment block.
+  cache_paths: &cache_paths
+    cache_paths:
+      - $HOME/.mozbuild
+      - $HOME/.cargo/registry
+      - $HOME/.cargo/git
+      - $HOME/.rustup
+      - $CM_BUILD_DIR/engine/firefox/obj-aarch64-apple-ios
+      - $CM_BUILD_DIR/support/idevice/target
+      - $CM_BUILD_DIR/.sccache
+
+workflows:
+  reynard-trollstore:
+    name: Reynard - TrollStore TIPA
+    instance_type: mac_mini_m2 # mac_mini_m4 (16GB) is faster but needs billing
+    max_build_duration: 120
+    environment:
+      xcode: 26.6
+      vars:
+        # Must be set before the clone step, so it cannot come from CM_ENV.
+        # tools/development/update-gecko.sh does a shallow init itself.
+        CM_RECURSIVE_SUBMODULE_INIT: "false"
+    cache: *cache_paths
+    scripts:
+      - *install_deps
+      - *gecko_source
+      - *gecko_patches
+      - name: Build Gecko
+        script: |
+          set -e
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
+          export CC=clang CXX=clang++ LD=ld64.lld MOZ_NOSPAM=1
+          ./tools/development/build-gecko.sh --use-sccache --auto-clobber
+      - *idevice
+      - *build_app
+      - name: Create TrollStore TIPA
+        script: ./tools/release/create-ipa.sh --trollstore
+    artifacts:
+      - dist/*.tipa
+
+  reynard-jailbroken:
+    name: Reynard - Jailbroken IPA
+    instance_type: mac_mini_m2
+    max_build_duration: 120
+    environment:
+      xcode: 26.6
+      vars:
+        CM_RECURSIVE_SUBMODULE_INIT: "false"
+    cache: *cache_paths
+    scripts:
+      - *install_deps
+      - *gecko_source
+      - *gecko_patches
+      - name: Build Gecko
+        script: |
+          set -e
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
+          export CC=clang CXX=clang++ LD=ld64.lld MOZ_NOSPAM=1
+          ./tools/development/build-gecko.sh --disable-jemalloc --use-sccache --auto-clobber
+      - *idevice
+      - *build_app
+      - name: Create Jailbroken IPA
+        script: ./tools/release/create-ipa.sh --jailbroken
+    artifacts:
+      - dist/*.ipa
